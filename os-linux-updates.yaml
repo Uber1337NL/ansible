@@ -1,0 +1,365 @@
+---
+# =========================
+# Play 1: Controller-voorbereiding
+# =========================
+- name: Prepare controller artifacts
+  hosts: localhost
+  gather_facts: false
+  no_log: true
+
+  tasks:
+    - name: Ensure report directory exists (controller)
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/tmp"
+        state: directory
+        mode: "0755"
+
+# =========================
+# Play 2: Patching (concurrent op targets)
+# =========================
+- name: Patching play for RedHat and Debian based servers
+  hosts: all
+  gather_facts: true
+  gather_subset:
+    - min
+    - network
+  serial: 20%
+  max_fail_percentage: 10
+  become: true
+  no_log: true
+
+  vars:
+    apply_security_only: false
+    include_kernel_updates: true
+    do_reboot: true
+    debian_reboot_flag: /var/run/reboot-required
+
+  pre_tasks:
+    - name: Assert supported OS families
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ['RedHat', 'Debian']
+        fail_msg: "Only RedHat and Debian families are supported."
+
+    - name: Wait until no other package managers are running (skip control host)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        is_busy=false
+
+        if [ "{{ ansible_os_family }}" = "Debian" ]; then
+          if pgrep -x "apt|apt-get|aptitude|dpkg|unattended-upgrade|packagekitd|pkcon" >/dev/null; then
+            is_busy=true
+          fi
+          if command -v fuser >/dev/null; then
+            if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+               fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+               fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+               fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+              is_busy=true
+            fi
+          fi
+
+        elif [ "{{ ansible_os_family }}" = "RedHat" ]; then
+          if pgrep -x "dnf|yum|rpm|packagekitd|pkcon" >/dev/null; then
+            is_busy=true
+          fi
+        fi
+
+        if [ "$is_busy" = true ]; then
+          pgrep -ax "apt|apt-get|aptitude|dpkg|unattended-upgrade|packagekitd|pkcon|dnf|yum|rpm" || true
+          echo "busy"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: pkg_guard
+      changed_when: false
+      retries: 30
+      delay: 20
+      until: pkg_guard.rc == 0
+      when: inventory_hostname != "ansible"
+      tags: [safety]
+
+    - name: Ensure needs-restarting available (RHEL/Alma 8)
+      ansible.builtin.package:
+        name: dnf-utils
+        state: present
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version | int == 8
+      register: dnf_utils_install
+      failed_when: false
+      tags: [patch, redhat]
+
+    - name: Ensure needs-restarting available (RHEL/Alma 9+)
+      ansible.builtin.package:
+        name: dnf-plugins-core
+        state: present
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version | int >= 9
+      register: dnf_plugins_install
+      failed_when: false
+      tags: [patch, redhat]
+
+  tasks:
+    # =========================
+    # === RedHat / Alma / RHEL
+    # =========================
+    - name: Preview available updates (RedHat)
+      ansible.builtin.command: dnf -q check-update
+      register: rh_preview
+      changed_when: false
+      failed_when: rh_preview.rc not in [0, 100]
+      when: ansible_os_family == "RedHat"
+      tags: [patch, redhat, report, plan]
+
+    - name: Apply updates using DNF (RedHat)
+      ansible.builtin.dnf:
+        name: "{{ '*' if include_kernel_updates else '*:!kernel*' }}"
+        state: latest
+        update_only: true
+        security: "{{ apply_security_only }}"
+      when: ansible_os_family == "RedHat"
+      register: rh_updates
+      tags: [patch, redhat]
+
+    - name: Get list of updated packages (RedHat)
+      ansible.builtin.command: dnf history info last
+      register: rh_update_list
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_updates.changed | default(false)
+      tags: [patch, redhat, report]
+
+    - name: Check if reboot is required (RedHat)
+      ansible.builtin.command: needs-restarting -r -s
+      register: rh_needs_reboot
+      changed_when: false
+      failed_when: rh_needs_reboot.rc not in [0, 1]
+      when: ansible_os_family == "RedHat"
+      tags: [patch, redhat]
+
+    # =========================
+    # === Debian / Ubuntu
+    # =========================
+    - name: Ensure /tmp has correct permissions (Debian)
+      ansible.builtin.file:
+        path: /tmp
+        state: directory
+        mode: "01777"
+      when: ansible_os_family == "Debian"
+      tags: [patch, debian]
+
+    - name: Update APT cache (Debian)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+      changed_when: false
+      tags: [patch, debian]
+
+    - name: Apply updates (Debian - all packages)
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        autoclean: true
+      when:
+        - ansible_os_family == "Debian"
+        - not apply_security_only
+      register: deb_updates
+      tags: [patch, debian]
+
+    - name: Apply security updates only (Debian)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        apt-get -s upgrade | awk '/Inst/ && /security/ {print $2}' | \
+        xargs -r apt-get install -y
+      args:
+        executable: /bin/bash
+      when:
+        - ansible_os_family == "Debian"
+        - apply_security_only
+      register: deb_updates
+      changed_when: "'0 upgraded' not in deb_updates.stdout"
+      tags: [patch, debian]
+
+    - name: Get last APT history block across rotated logs (Debian - post)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ( zcat -f /var/log/apt/history.log* 2>/dev/null || cat /var/log/apt/history.log ) \
+        | awk '/Start-Date:/{blk=""; inblk=1} {if(inblk) blk=blk $0 ORS} /End-Date:/{last=blk; inblk=0} END{if(last) printf "%s", last}'
+      args:
+        executable: /bin/bash
+      register: deb_update_list
+      changed_when: false
+      when:
+        - ansible_os_family == "Debian"
+        - deb_updates.changed | default(false)
+      tags: [patch, debian, report]
+
+    - name: Check if reboot is required (Debian)
+      ansible.builtin.stat:
+        path: "{{ debian_reboot_flag }}"
+      register: deb_reboot_flag
+      when: ansible_os_family == "Debian"
+      changed_when: false
+      tags: [patch, debian]
+
+    # =========================
+    # === Unified reboot step
+    # =========================
+    - name: Reboot if needed
+      ansible.builtin.reboot:
+        msg: "Rebooting after OS package updates"
+        reboot_timeout: 1800
+      when: >
+        do_reboot and (
+          (ansible_os_family == "RedHat" and rh_needs_reboot.rc == 1) or
+          (ansible_os_family == "Debian" and deb_reboot_flag.stat.exists | default(false))
+        )
+      tags: [patch, reboot]
+
+    - name: Wait for SSH after reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+      when: >
+        do_reboot and (
+          (ansible_os_family == "RedHat" and rh_needs_reboot.rc == 1) or
+          (ansible_os_family == "Debian" and deb_reboot_flag.stat.exists | default(false))
+        )
+      tags: [postcheck]
+
+    # =========================
+    # === Post checks
+    # =========================
+    - name: Verify machine is back (uptime)
+      ansible.builtin.command: uptime
+      register: uptime_out
+      changed_when: false
+      failed_when: uptime_out.rc != 0
+      tags: [postcheck]
+
+    - name: Check kernel version
+      ansible.builtin.command: uname -r
+      register: kernel_ver
+      changed_when: false
+      tags: [postcheck]
+
+    - name: Check system running state
+      ansible.builtin.systemd:
+        daemon_reload: false
+      check_mode: true
+      register: sys_state
+      changed_when: false
+      failed_when: false
+      tags: [postcheck]
+
+    - name: Verify system is running or degraded
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.service_mgr == 'systemd'
+        fail_msg: "System is not in a healthy state"
+        success_msg: "System state is acceptable"
+      tags: [postcheck]
+
+    # =========================
+    # === Per-host rapportage (stil)
+    # =========================
+    - name: Build updated packages list (structured)
+      ansible.builtin.set_fact:
+        updated_packages: >-
+          {%- if ansible_os_family == 'RedHat' and rh_update_list.stdout is defined -%}
+            {{ rh_update_list.stdout | regex_findall('([a-zA-Z0-9._+-]+)\\s+([0-9:.-]+)\\s+->\\s+([0-9:.-]+)') | list }}
+          {%- elif ansible_os_family == 'Debian' and deb_update_list.stdout is defined -%}
+            {{ deb_update_list.stdout | regex_findall('([a-zA-Z0-9._:+-]+):[a-z0-9]+ \\(([^,]+), ([^)]+)\\)') | list }}
+          {%- else -%}
+            []
+          {%- endif -%}
+      no_log: true
+      tags: [report]
+
+    - name: Save JSON report per host on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        content: |
+          {
+            "host": "{{ inventory_hostname }}",
+            "os_family": "{{ ansible_os_family }}",
+            "changed": {{ (rh_updates.changed if ansible_os_family == 'RedHat' else deb_updates.changed) | default(false) | tojson }},
+            "reboot_required": {{ ((rh_needs_reboot.rc == 1) if ansible_os_family == 'RedHat' else (deb_reboot_flag.stat.exists | default(false))) | tojson }},
+            "updated_packages": {{ updated_packages | tojson }},
+            "time": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ lookup('env', 'HOME') }}/patch-report-{{ inventory_hostname }}-{{ ansible_date_time.date | regex_replace('-', '') }}.json"
+        mode: "0644"
+        force: true
+      no_log: true
+      changed_when: false
+      tags: [report]
+
+    - name: Build per-host summary entry
+      ansible.builtin.set_fact:
+        patch_summary_entry:
+          host: "{{ inventory_hostname }}"
+          os_family: "{{ ansible_os_family }}"
+          rebooted: >-
+            {{
+              (ansible_os_family == 'RedHat' and rh_needs_reboot.rc == 1)
+              or
+              (ansible_os_family == 'Debian' and deb_reboot_flag.stat.exists | default(false))
+            }}
+          updated_packages: "{{ updated_packages | default([]) }}"
+          patch_time: "{{ ansible_date_time.iso8601 }}"
+      no_log: true
+      tags: [report]
+
+  handlers: []
+
+# =========================
+# Play 3: Final summary on controller
+# =========================
+- name: PATCH SUMMARY REPORT
+  hosts: localhost
+  gather_facts: false
+  # Geen no_log hier, we willen de tabel zien
+
+  tasks:
+    - name: Collect patch summary from all hosts
+      ansible.builtin.set_fact:
+        patch_summary: >-
+          {{
+            groups['all']
+            | map('extract', hostvars, 'patch_summary_entry')
+            | select('defined')
+            | list
+          }}
+      no_log: true
+
+    # For clean table output in Semaphore, add this to ansible.cfg: stdout_callback = yaml
+    - name: Build ASCII patch report table
+      ansible.builtin.set_fact:
+        patch_summary_table: |
+          ╔══════════════════════╦═══════════╦══════════╦══════════════════════════════╗
+          ║ Host                 ║ OS        ║ Rebooted ║ Updated packages             ║
+          ╠══════════════════════╬═══════════╬══════════╬══════════════════════════════╣
+          {% for item in patch_summary %}
+          ║ {{ "%-20s"|format(item.host) }} ║ {{ "%-9s"|format(item.os_family) }} ║ {{ "%-8s"|format(item.rebooted | ternary("YES ✓","no    ")) }} ║ {{ "%-28s"|format((item.updated_packages | length) ~ " package(s) updated") }} ║
+          {% endfor %}
+          ╚══════════════════════╩═══════════╩══════════╩══════════════════════════════╝
+      no_log: true
+
+    - name: FINAL PATCH REPORT
+      ansible.builtin.debug:
+        msg: "{{ patch_summary_table }}"
+      changed_when: true
+
+    - name: Save combined patch summary JSON on controller
+      ansible.builtin.copy:
+        content: "{{ patch_summary | to_nice_json }}"
+        dest: "{{ lookup('env', 'HOME') }}/patch-summary-{{ now(fmt='%Y%m%d') }}.json"
+        mode: "0644"
+        # no_log verwijderd zodat je fouten hier kunt zien
