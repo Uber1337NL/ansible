@@ -92,7 +92,7 @@ fetch_release_info() {
         --retry-delay 2 \
         --retry-all-errors \
         -H "Accept: application/vnd.github+json" \
-        ${auth_args[@]+"${auth_args[@]}"} \
+        "${auth_args[@]}" \
         -o "$tmpfile" -w "%{http_code}" \
         "$GITHUB_API")
     local curl_exit=$?
@@ -140,28 +140,19 @@ parse_release() {
     local release_info="$1"
     local arch="$2"
 
-    if command -v jq &>/dev/null; then
-        # Prefer robust JSON parsing with jq when available
-        RELEASE=$(echo "$release_info" | jq -r '.tag_name // empty')
-        DOWNLOAD_URL=$(echo "$release_info" \
-            | jq -r --arg arch "$arch" '.assets[].browser_download_url | select(test($arch + "\\.deb$"))' \
-            | head -n 1)
-    else
-        # Fallback to fragile grep/awk-based parsing if jq is not installed
-        log_warn "jq not found, falling back to grep-based JSON parsing."
-        RELEASE=$(echo "$release_info" | grep '"tag_name"' | awk -F'"' '{print $4}')
-        # Match browser_download_url for the correct arch .deb asset
-        DOWNLOAD_URL=$(echo "$release_info" \
-            | grep -o "\"browser_download_url\": \"[^\"]*${arch}\.deb\"" \
-            | head -n 1 \
-            | awk -F'"' '{print $4}')
-    fi
-
+    RELEASE=$(echo "$release_info" | grep '"tag_name"' | awk -F'"' '{print $4}')
     if [[ -z "$RELEASE" ]]; then
         log_error "Could not parse tag_name from GitHub response."
         log_error "Response head: $(echo "$release_info" | head -c 300)"
         exit 1
     fi
+
+    # Match browser_download_url for the correct arch .deb asset
+    DOWNLOAD_URL=$(echo "$release_info" \
+        | grep -o "\"browser_download_url\": \"[^\"]*${arch}\.deb\"" \
+        | head -n 1 \
+        | awk -F'"' '{print $4}')
+
     if [[ -z "$DOWNLOAD_URL" ]]; then
         log_error "Could not find a .deb download URL for architecture '${arch}'."
         log_error "Available assets:"
@@ -224,7 +215,7 @@ parse_release "$RELEASE_INFO" "$ARCH"
 
 CURRENT_VERSION=$(get_current_version)
 LATEST_VERSION="${RELEASE#v}"
-read -rp "${YELLOW}New version available ($LATEST_VERSION). Proceed with update? (y/n): ${RESET}" confirm
+
 log_info "Current version : $CURRENT_VERSION"
 log_info "Latest version  : $LATEST_VERSION"
 
@@ -289,3 +280,4 @@ else
 fi
 
 echo -e "${GREEN}=== Update completed! ===${RESET}"
+
